@@ -233,6 +233,7 @@ status=()
 patch=()
 clean_build=()
 final_message=()
+submodule=()
 
 function add_customization() {
     customization+=("$1")
@@ -240,6 +241,10 @@ function add_customization() {
     message_function+=("$3")
     clean_build+=("$4")
     final_message+=("$5")
+    # Optional submodule path that this customization adds to .gitmodules and
+    # therefore must be fetched (cloned) after the patch is applied so that the
+    # referenced Xcode project exists. Leave blank for source-only patches.
+    submodule+=("$6")
 }
 
 folder_translation_from=()
@@ -394,6 +399,38 @@ function display_unapplicable_patches() {
     fi
 }
 
+# Clones the submodule a customization references (reading the URL the patch
+# just added to .gitmodules) so the referenced Xcode project exists. The patch
+# itself only edits .gitmodules/workspace/scheme; the source must be fetched.
+function fetch_customization_submodule {
+    local sub_path="$1"
+    [ -z "$sub_path" ] && return 0
+    if [ -e "$sub_path/.git" ]; then
+        return 0  # already present, nothing to do
+    fi
+    local sub_url
+    sub_url=$(git config -f .gitmodules --get "submodule.${sub_path}.url" 2>/dev/null)
+    if [ -z "$sub_url" ]; then
+        echo -e "${ERROR_FONT}  Could not find URL for submodule $sub_path in .gitmodules${NC}"
+        return 1
+    fi
+    echo -e "${INFO_FONT}  Fetching $sub_path, please wait  ...  patiently  ...${NC}"
+    if git clone --quiet "$sub_url" "$sub_path"; then
+        erase_previous_line
+        return 0
+    fi
+    echo -e "${ERROR_FONT}  Failed to clone $sub_path from $sub_url${NC}"
+    return 1
+}
+
+# Removes a submodule directory that a customization added, so that reverting
+# the customization fully restores the workspace.
+function remove_customization_submodule {
+    local sub_path="$1"
+    [ -z "$sub_path" ] && return 0
+    [ -d "$sub_path" ] && rm -rf "$sub_path"
+}
+
 function apply_patch {
     local index=$1
     local patch_file="${patch[$index]}"
@@ -409,6 +446,9 @@ function apply_patch {
     
         if git apply --whitespace=nowarn "$patch_file"; then
             echo -e "${SUCCESS_FONT}  Customization $customization_name applied successfully${NC}"
+            if [ -n "${submodule[$index]}" ]; then
+                fetch_customization_submodule "${submodule[$index]}" || return_when_ready
+            fi
             if [ "${clean_build[$index]}" == "1" ]; then
                 echo -e "${INFO_FONT}  Cleaning build folder, please wait  ...  patiently  ...${NC}"
                 xcodebuild -quiet -workspace "${workingdir}/LoopWorkspace.xcworkspace" -scheme LoopWorkspace clean 2>/dev/null
@@ -432,6 +472,9 @@ function apply_patch_command_line {
     if [ -f "$patch_file" ]; then
         if git apply --whitespace=nowarn "$patch_file"; then
             echo -e "${SUCCESS_FONT}  Customization $customization_name applied successfully${NC}"
+            if [ -n "${submodule[$index]}" ]; then
+                fetch_customization_submodule "${submodule[$index]}" || exit 1
+            fi
         else
             echo -e "${ERROR_FONT}  Failed to apply customization $customization_name${NC}"
             exit 1
@@ -458,6 +501,9 @@ function revert_patch {
         
         if git apply --whitespace=nowarn --reverse "$patch_file"; then
             echo -e "${SUCCESS_FONT}  Customization $customization_name reverted successfully${NC}"
+            if [ -n "${submodule[$index]}" ]; then
+                remove_customization_submodule "${submodule[$index]}"
+            fi
             if [ "${clean_build[$index]}" == "1" ]; then
                 echo -e "${INFO_FONT}  Cleaning build folder, please wait  ...  patiently  ...${NC}"
                 xcodebuild -quiet -workspace "${workingdir}/LoopWorkspace.xcworkspace" -scheme LoopWorkspace clean 2>/dev/null
@@ -711,8 +757,6 @@ function message_generic() {
     echo "  These Customizations are documented on the Loop and Learn web site"
     echo "        https://www.loopandlearn.org/custom-code#custom-list"
     echo
-    echo "  These customizations are valid for Loop 3.6"
-    echo
 }
 
 # this is always used - it is the incompatible patches message - it can be blank
@@ -751,8 +795,16 @@ function message_for_negative_insulin() {
 }
 
 function message_for_remote_window() {
-    printf "       Increase the time-out for LoopCaregiver remote command OTP to 15 minutes\n"
-    printf "          https://www.loopandlearn.org/loop-features-in-development#remote-window\n\n"
+    printf "        Increase the time-out for Loop remote command One Time Password to 10 minutes\n"
+    printf "        This increased window applies to remote commands from LoopCaregiver,\n"
+    printf "          LoopFollow or from Nightscout Careportal\n"
+    printf "            https://www.loopandlearn.org/loop-features-in-development#remote-window\n\n"
+}
+
+function message_for_xdrip() {
+    printf "        Add xDrip4iOS as a CGM source for Loop using a shared App Group\n"
+    printf "        Applying this also clones the xdrip-client-swift plugin into the workspace\n"
+    printf "          https://www.loopandlearn.org/custom-code#custom-list\n\n"
 }
 
 function message_for_food_search() {
@@ -771,8 +823,11 @@ function message_for_food_search() {
 #   User facing information for option
 #   Folder name in the patch repo
 #   (Optional) message function shown prior to option
+#   (Optional) clean_build flag ("1" to clean the build folder)
+#   (Optional) final_message shown (with a pause) before applying
+#   (Optional) submodule path to clone after the patch is applied
 
-add_customization "Change Default to Upload Dexcom Readings" "dexcom_upload_readings"
+add_customization "(Included in 3.10.0) Change Default to Upload Dexcom Readings" "dexcom_upload_readings"
 add_customization "Increase Future Carbs Limit to 4 hours" "future_carbs_4h"
 add_customization "Modify Carb Warning & Limit: Low Carb to 49 & 99" "low_carb_limit"
 add_customization "Modify Carb Warning & Limit: High Carb to 201 & 300" "high_carb_limit"
@@ -790,10 +845,14 @@ add_customization "Display a Week of Meal History (Slow after Restart)" "meal_we
 add_customization "Profile Save & Load" "profiles" "message_for_profiles"
 add_customization "Basal Lock" "basal_lock" "message_for_basal_lock" "1"
 # live_activity changes the minimum iOS allowed and therefore requires xcode to be closed
-add_customization "Live Activity/Dynamic Island" "live_activity" "message_for_live_activity" "1" "Verify that Xcode is closed before continuing!"
+add_customization "(Included in 3.10.0) Live Activity/Dynamic Island" "live_activity" "message_for_live_activity" "1" "Verify that Xcode is closed before continuing!"
 add_customization "Negative Insulin Damper" "negative_insulin" "message_for_negative_insulin"
 
-add_customization "Increase Remote Window to 15 minutes" "remote_window" "message_for_remote_window"
+add_customization "Increase Remote Window to 10 minutes" "remote_window" "message_for_remote_window"
+
+# xdrip_cgm adds the xdrip-client-swift submodule, so the 6th arg tells the
+# script to clone it after the patch is applied
+add_customization "Add xDrip4iOS as a CGM (clones xdrip-client-swift)" "xdrip_cgm" "message_for_xdrip" "" "" "xdrip-client-swift"
 
 add_customization "Preliminary Food Search" "food_search" "message_for_food_search" "1"
 
